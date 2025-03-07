@@ -69,31 +69,30 @@ impl Transaction {
         _upper: Bound<&[u8]>,
     ) -> Result<TxnIterator> {
         self.panic_if_commited();
-        let mut local_iter = TxnLocalIteratorBuilder {
-            map: self.local_storage.clone(),
-            iter_builder: |map| map.range((map_bound_bytes(_lower), map_bound_bytes(_upper))),
-            item: (Bytes::new(), Bytes::new()),
-        }
-        .build();
-        let entry = local_iter.with_iter_mut(|iter| TxnLocalIterator::entry_to_item(iter.next()));
-        local_iter.with_mut(|x| *x.item = entry);
-        let mut iter = TxnIterator::create(
-            self.clone(),
-            TwoMergeIterator::create(
-                local_iter,
-                LsmStorageInner::scan_with_ts(&self.inner, _lower, _upper, self.read_ts)?,
-            )?,
-        )?;
-        {
-            let read_key_hash = &mut self.key_hashes.as_ref().unwrap().lock().0;
-            // println!("Scan add: {:?}",Bytes::copy_from_slice(iter.key()));
-            while iter.is_valid() {
-                read_key_hash.insert(farmhash::hash32(iter.key()));
-                iter.next()?;
-            }
-        }
+        // let mut local_iter = TxnLocalIteratorBuilder {
+        //     map: self.local_storage.clone(),
+        //     iter_builder: |map| map.range((map_bound_bytes(_lower), map_bound_bytes(_upper))),
+        //     item: (Bytes::new(), Bytes::new()),
+        // }
+        // .build();
+        // let entry = local_iter.with_iter_mut(|iter| TxnLocalIterator::entry_to_item(iter.next()));
+        // local_iter.with_mut(|x| *x.item = entry);
+        // let mut iter = TxnIterator::create(
+        //     self.clone(),
+        //     TwoMergeIterator::create(
+        //         local_iter,
+        //         LsmStorageInner::scan_with_ts(&self.inner, _lower, _upper, self.read_ts)?,
+        //     )?,
+        // )?;
+        // {
+        //     let read_key_hash = &mut self.key_hashes.as_ref().unwrap().lock().0;
+        //     // println!("Scan add: {:?}",Bytes::copy_from_slice(iter.key()));
+        //     while iter.is_valid() {
+        //         read_key_hash.insert(farmhash::hash32(iter.key()));
+        //         iter.next()?;
+        //     }
+        // }
 
-        //New one is built
         let mut local_iter = TxnLocalIteratorBuilder {
             map: self.local_storage.clone(),
             iter_builder: |map| map.range((map_bound_bytes(_lower), map_bound_bytes(_upper))),
@@ -163,7 +162,7 @@ impl Transaction {
             }
         }
 
-        let write_entry_exists = { self.key_hashes.as_ref().unwrap().lock().1.len() > 0 };
+        let write_entry_exists = { !self.key_hashes.as_ref().unwrap().lock().1.is_empty() };
         if write_entry_exists {
             // Get transactions within the range
             let check_transactions_iterator =
@@ -172,7 +171,7 @@ impl Transaction {
             for check_transaction in check_transactions_iterator {
                 let key_hashes = { &self.key_hashes.as_ref().unwrap().lock().0 };
                 for key_hash in key_hashes {
-                    if check_transaction.1.key_hashes.contains(&key_hash) {
+                    if check_transaction.1.key_hashes.contains(key_hash) {
                         bail!("Transaction is not serializeable");
                     }
                 }
@@ -186,7 +185,7 @@ impl Transaction {
             CommittedTxnData {
                 key_hashes: self.key_hashes.as_ref().unwrap().lock().1.clone(),
                 read_ts: self.read_ts,
-                commit_ts: commit_ts,
+                commit_ts,
             },
         );
         self.committed.store(true, Ordering::SeqCst);
@@ -259,12 +258,25 @@ pub struct TxnIterator {
 }
 
 impl TxnIterator {
+    pub fn add_to_read_keyhash(&self, key: &[u8]) {
+        self.txn
+            .key_hashes
+            .as_ref()
+            .unwrap()
+            .lock()
+            .0
+            .insert(farmhash::hash32(key));
+    }
+
     pub fn create(
         txn: Arc<Transaction>,
         iter: TwoMergeIterator<TxnLocalIterator, FusedIterator<LsmIterator>>,
     ) -> Result<Self> {
         let mut temp_self = Self { txn, iter };
         temp_self.move_to_non_delete()?;
+        if temp_self.is_valid() {
+            temp_self.add_to_read_keyhash(temp_self.key());
+        }
         Ok(temp_self)
     }
 
@@ -295,6 +307,9 @@ impl StorageIterator for TxnIterator {
     fn next(&mut self) -> Result<()> {
         self.iter.next()?;
         self.move_to_non_delete()?;
+        if self.is_valid() {
+            self.add_to_read_keyhash(self.key());
+        }
         Ok(())
     }
 
