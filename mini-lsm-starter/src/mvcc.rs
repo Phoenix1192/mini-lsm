@@ -2,13 +2,15 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 pub mod txn;
-mod watermark;
+pub mod watermark;
 
 use std::{
     collections::{BTreeMap, HashSet},
-    sync::Arc,
+    sync::{atomic::AtomicBool, Arc},
 };
 
+use bytes::Bytes;
+use crossbeam_skiplist::SkipMap;
 use parking_lot::Mutex;
 
 use crate::lsm_storage::LsmStorageInner;
@@ -55,6 +57,28 @@ impl LsmMvccInner {
     }
 
     pub fn new_txn(&self, inner: Arc<LsmStorageInner>, serializable: bool) -> Arc<Transaction> {
-        unimplemented!()
+        let read_ts = {
+            let ts_lock = self.write_lock.lock(); // Lock acquired
+            let read_ts = self.latest_commit_ts() + 1;
+            println!("Transaction Ts {:?}", read_ts);
+
+            self.update_commit_ts(read_ts);
+            read_ts
+        };
+
+        // TODO(me) Not sure how to use the serializeable thing here
+        let txn_obj = Transaction {
+            read_ts,
+            inner,
+            local_storage: Arc::new(SkipMap::<Bytes, Bytes>::new()),
+            committed: Arc::new(AtomicBool::new(false)),
+            key_hashes: Some(Mutex::new((HashSet::new(), HashSet::new()))),
+        };
+
+        // Register the watermark
+        let mut ts = self.ts.lock();
+        ts.1.add_reader(read_ts);
+
+        Arc::new(txn_obj)
     }
 }
