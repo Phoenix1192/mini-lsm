@@ -21,6 +21,10 @@ pub struct SstConcatIterator {
 
 impl SstConcatIterator {
     fn find_sst_iterator(&self, key_pass: KeySlice) -> Result<Option<SsTableIterator>> {
+        if self.sstables.is_empty() {
+            return Ok(None);
+        }
+
         let mut idx = self
             .sstables
             .partition_point(|sst| sst.first_key().as_key_slice() <= key_pass)
@@ -36,6 +40,18 @@ impl SstConcatIterator {
             return Ok(Some(self.seek_sst_idx_key(idx, key_pass)?));
         }
         Ok(None)
+    }
+
+    fn new_element(
+        current: Option<SsTableIterator>,
+        next_sst_idx: usize,
+        sstables: Vec<Arc<SsTable>>,
+    ) -> Self {
+        return Self {
+            current,
+            next_sst_idx,
+            sstables,
+        };
     }
 
     fn seek_sst_idx_first(&self, idx: usize) -> Result<SsTableIterator> {
@@ -93,13 +109,11 @@ impl StorageIterator for SstConcatIterator {
     }
 
     fn is_valid(&self) -> bool {
-        if self.current.is_none() {
-            return false;
+        match self.current.as_ref() {
+            Some(it) if it.is_valid() => return true,
+            Some(_) if self.next_sst_idx < self.sstables.len() => return true,
+            _ => return false,
         }
-        if !self.current.as_ref().unwrap().is_valid() && self.next_sst_idx == self.sstables.len() {
-            return false;
-        }
-        true
     }
 
     fn next(&mut self) -> Result<()> {

@@ -296,43 +296,46 @@ impl LsmStorageInner {
         };
 
         let manifest_path = path.join("MANIFEST");
-        let manifest_object;
-        let manifest_records;
-        if !manifest_path.is_file() {
-            manifest_object = Manifest::create(manifest_path)?;
-            manifest_records = vec![];
+        let (manifest_object, manifest_records) = if manifest_path.is_file() {
+            Manifest::recover(manifest_path)?
         } else {
-            (manifest_object, manifest_records) = Manifest::recover(manifest_path)?;
-        }
+            (Manifest::create(manifest_path)?, vec![])
+        };
 
         let mut memtable_ids = BTreeSet::new();
-        for record in manifest_records {
-            if let ManifestRecord::Flush(sst_id) = record {
-                if compaction_controller.flush_to_l0() {
-                    state.l0_sstables.insert(0, sst_id);
-                } else {
-                    // Tiered Compaction
-                    state.levels.insert(0, (sst_id, vec![sst_id]));
-                }
-                // Remove the flushed Memtables
-                memtable_ids.remove(&sst_id);
-                next_sst_id = next_sst_id.max(sst_id);
-            } else if let ManifestRecord::Compaction(compaction_task, output_ids) = record {
-                let (new_state, _) = compaction_controller.apply_compaction_result(
-                    &state,
-                    &compaction_task,
-                    &output_ids[..],
-                    true,
-                ); // Not sure if apply_compaction_result must be true here
-                state = new_state;
 
-                next_sst_id = next_sst_id.max(output_ids.iter().max().copied().unwrap_or_default());
-            } else if let ManifestRecord::NewMemtable(id) = record {
-                // Insert the new memtable
-                memtable_ids.insert(id);
-                next_sst_id = next_sst_id.max(id);
-            } else {
-                panic!("Invalid Manifest Record type")
+        for record in manifest_records {
+            match record {
+                ManifestRecord::Flush(sst_id) => {
+                    if compaction_controller.flush_to_l0() {
+                        state.l0_sstables.insert(0, sst_id);
+                    } else {
+                        // Tiered Compaction
+                        state.levels.insert(0, (sst_id, vec![sst_id]));
+                    }
+                    // Remove the flushed Memtables
+                    memtable_ids.remove(&sst_id);
+                    next_sst_id = next_sst_id.max(sst_id);
+                }
+                ManifestRecord::Compaction(compaction_task, output_ids) => {
+                    let (new_state, _) = compaction_controller.apply_compaction_result(
+                        &state,
+                        &compaction_task,
+                        &output_ids[..],
+                        true,
+                    ); // Not sure if apply_compaction_result must be true here
+                    state = new_state;
+
+                    // Update the sst_id value
+                    if let Some(&max_sst_id) = output_ids.iter().max() {
+                        next_sst_id = next_sst_id.max(max_sst_id);
+                    }
+                }
+                ManifestRecord::NewMemtable(table_id) => {
+                    // Insert the new memtable
+                    memtable_ids.insert(table_id);
+                    next_sst_id = next_sst_id.max(table_id);
+                }
             }
         }
 
@@ -340,43 +343,48 @@ impl LsmStorageInner {
 
         // Recover the ssts from the file objects
         // Note that deleted tables are never present in sstable map so no need to delete
-        for sst_id_ptr in state
+        for &recovery_sst_id in state
             .l0_sstables
             .iter()
             .chain(state.levels.iter().flat_map(|x| x.1.iter()))
         {
-            let sst_id = *sst_id_ptr;
-            let ss_table = SsTable::open(
-                sst_id,
+            let recovery_ss_table = SsTable::open(
+                recovery_sst_id,
                 Some(block_cache.clone()),
-                FileObject::open(&Self::path_of_sst_static(path, sst_id))
+                FileObject::open(&Self::path_of_sst_static(path, recovery_sst_id))
                     .context("failed to open SST")?,
             )?;
-            mvcc_ts = mvcc_ts.max(ss_table.max_ts());
-            // println!("Mvcc,Ts {:?}",mvcc_ts);
-            state.sstables.insert(sst_id, Arc::new(ss_table));
+            mvcc_ts = mvcc_ts.max(recovery_ss_table.max_ts());
+            state
+                .sstables
+                .insert(recovery_sst_id, Arc::new(recovery_ss_table));
         }
 
         let state_lock = Mutex::new(());
-        // println!("Reached till wal extraction");
         if options.enable_wal {
-            let mut wal_cnt = 0;
+            let mut wal_count = 0;
+
             // Added the memtables with wal's to imm_memtables
             for id in memtable_ids {
-                println!("Extracted {:?}", id);
-                wal_cnt += 1;
-                let mem_table = Arc::new(MemTable::recover_from_wal(
+                wal_count += 1;
+
+                let recovered_memtable = Arc::new(MemTable::recover_from_wal(
                     id,
                     Self::path_of_wal_static(path, id),
                 )?);
-                let mut memtable_iterator = mem_table.scan(Bound::Unbounded, Bound::Unbounded);
+                let mut memtable_iterator =
+                    recovered_memtable.scan(Bound::Unbounded, Bound::Unbounded);
+
+                // Update the MVCC Timestamp
                 while memtable_iterator.is_valid() {
                     mvcc_ts = mvcc_ts.max(memtable_iterator.key().ts());
                     memtable_iterator.next()?;
                 }
 
-                state.imm_memtables.insert(0, mem_table);
+                state.imm_memtables.insert(0, recovered_memtable);
             }
+
+            // Create an empty memtable
             state.memtable = Arc::new(MemTable::create_with_wal(
                 next_sst_id + 1,
                 Self::path_of_wal_static(path, next_sst_id + 1),
@@ -385,7 +393,7 @@ impl LsmStorageInner {
                 &state_lock.lock(),
                 ManifestRecord::NewMemtable(next_sst_id + 1),
             )?;
-            println!("Extracted Wals {:?}", wal_cnt);
+            println!("Extracted Wals {:?}", wal_count);
         } else {
             state.memtable = Arc::new(MemTable::create(next_sst_id + 1));
         }
@@ -421,21 +429,20 @@ impl LsmStorageInner {
     }
 
     fn key_within(table: &SsTable, key: &[u8]) -> bool {
-        if table.first_key().key_ref() > key || table.last_key().key_ref() < key {
-            return false;
-        }
-        true
+        return !(table.first_key().key_ref() > key || table.last_key().key_ref() < key);
     }
 
     pub fn range_overlap(table: &SsTable, _lower: Bound<&[u8]>, _upper: Bound<&[u8]>) -> bool {
+        let first_key = table.first_key().key_ref();
+        let last_key = table.last_key().key_ref();
         match _lower {
-            Bound::Included(val) => {
-                if val > table.last_key().key_ref() {
+            Bound::Included(lower_limit) => {
+                if lower_limit > last_key {
                     return false;
                 }
             }
-            Bound::Excluded(val) => {
-                if val >= table.last_key().key_ref() {
+            Bound::Excluded(lower_limit) => {
+                if lower_limit >= last_key {
                     return false;
                 }
             }
@@ -443,13 +450,13 @@ impl LsmStorageInner {
         };
 
         match _upper {
-            Bound::Included(val) => {
-                if val < table.first_key().key_ref() {
+            Bound::Included(upper_limit) => {
+                if upper_limit < first_key {
                     return false;
                 }
             }
-            Bound::Excluded(val) => {
-                if val <= table.first_key().key_ref() {
+            Bound::Excluded(upper_limit) => {
+                if upper_limit <= first_key {
                     return false;
                 }
             }
@@ -459,74 +466,57 @@ impl LsmStorageInner {
         true
     }
 
-    pub fn keep_table(sstable: Arc<SsTable>, _key: &[u8]) -> bool {
-        if !Self::key_within(&sstable, _key)
-            || (sstable.bloom.is_some()
-                && !sstable
-                    .bloom
-                    .as_ref()
-                    .unwrap()
-                    .may_contain(farmhash::fingerprint32(_key)))
-        {
-            return false;
-        }
-
-        true
+    pub fn keep_table(sstable: &Arc<SsTable>, key: &[u8]) -> bool {
+        let key_within = Self::key_within(&sstable, key);
+        let bloom_ok = match &sstable.bloom {
+            Some(bloom) => bloom.may_contain(farmhash::fingerprint32(key)),
+            None => true,
+        };
+        return key_within && bloom_ok;
     }
 
-    pub fn box_maker<I>(vec: Vec<I>) -> Vec<Box<I>>
+    pub fn box_maker<I>(vector: Vec<I>) -> Vec<Box<I>>
     where
         I: StorageIterator,
     {
-        let mut sol = Vec::new();
-        for v in vec {
-            sol.push(Box::new(v));
-        }
-        sol
+        vector.into_iter().map(Box::new).collect()
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get<'a>(self: &'a Arc<Self>, _key: &[u8]) -> Result<Option<Bytes>> {
+    pub fn get<'a>(self: &'a Arc<Self>, key: &[u8]) -> Result<Option<Bytes>> {
         let txn = self.mvcc.as_ref().unwrap().new_txn(self.clone(), true);
-        txn.get(_key)
+        txn.get(key)
     }
 
-    pub fn get_with_ts(&self, _key: &[u8], read_ts: u64) -> Result<Option<Bytes>> {
-        let data = {
-            let guard = self.state.read();
-            Arc::clone(&guard)
-        };
+    pub fn get_with_ts(&self, key: &[u8], read_ts: u64) -> Result<Option<Bytes>> {
+        let snapshot = { Arc::clone(&self.state.read()) };
 
-        let mut mem_table_iters = Vec::with_capacity(data.imm_memtables.len() + 1);
+        let mut mem_table_iterators = Vec::with_capacity(snapshot.imm_memtables.len() + 1);
 
-        let lower = Bound::Included(KeySlice::from_slice(_key, TS_RANGE_BEGIN));
-        let upper = Bound::Included(KeySlice::from_slice(_key, TS_RANGE_END));
+        let key_slice = KeySlice::from_slice(key, TS_RANGE_BEGIN);
+        let lower = Bound::Included(key_slice);
+        let upper = Bound::Included(KeySlice::from_slice(key, TS_RANGE_END));
 
-        mem_table_iters.push(data.memtable.scan(lower, upper));
-
-        for table in data.imm_memtables.iter() {
-            mem_table_iters.push(table.scan(lower, upper))
+        mem_table_iterators.push(snapshot.memtable.scan(lower, upper));
+        for table in snapshot.imm_memtables.iter() {
+            mem_table_iterators.push(table.scan(lower, upper))
         }
 
-        let key_slice = KeySlice::from_slice(_key, TS_RANGE_BEGIN);
-        let mut l0_iters = Vec::with_capacity(data.l0_sstables.len());
-        for sst_index in data.l0_sstables.iter() {
-            let sstable = data.sstables[sst_index].clone();
-
-            if !Self::keep_table(sstable.clone(), _key) {
+        let mut l0_iterators = Vec::with_capacity(snapshot.l0_sstables.len());
+        for sst_index in snapshot.l0_sstables.iter() {
+            let sstable = snapshot.sstables[sst_index].clone();
+            if !Self::keep_table(&sstable, key) {
                 continue;
             }
-
-            l0_iters.push(SsTableIterator::create_and_seek_to_key(sstable, key_slice)?);
+            l0_iterators.push(SsTableIterator::create_and_seek_to_key(sstable, key_slice)?);
         }
 
-        let mut level_iters = Vec::with_capacity(data.levels.len());
-
-        for i in 0..data.levels.len() {
+        let mut level_iters = Vec::with_capacity(snapshot.levels.len());
+        for i in 0..snapshot.levels.len() {
             let mut sst_level_tables = Vec::new();
-            for table_id in data.levels[i].1.iter() {
-                if Self::keep_table(data.sstables[table_id].clone(), _key) {
-                    sst_level_tables.push(data.sstables[table_id].clone());
+            for table_id in snapshot.levels[i].1.iter() {
+                if Self::keep_table(&snapshot.sstables[table_id], key) {
+                    sst_level_tables.push(snapshot.sstables[table_id].clone());
                 }
             }
 
@@ -539,8 +529,8 @@ impl LsmStorageInner {
         let complete_iterator = LsmIterator::new(
             TwoMergeIterator::create(
                 TwoMergeIterator::create(
-                    MergeIterator::create(Self::box_maker(mem_table_iters)),
-                    MergeIterator::create(Self::box_maker(l0_iters)),
+                    MergeIterator::create(Self::box_maker(mem_table_iterators)),
+                    MergeIterator::create(Self::box_maker(l0_iterators)),
                 )?,
                 MergeIterator::create(Self::box_maker(level_iters)),
             )?,
@@ -549,7 +539,7 @@ impl LsmStorageInner {
         )?;
 
         if complete_iterator.is_valid()
-            && complete_iterator.key() == _key
+            && complete_iterator.key() == key
             && !complete_iterator.value().is_empty()
         {
             return Ok(Some(Bytes::copy_from_slice(complete_iterator.value())));
@@ -563,6 +553,10 @@ impl LsmStorageInner {
         self: &Arc<Self>,
         batch: &[WriteBatchRecord<T>],
     ) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
         if self.options.serializable {
             let txn = self.mvcc.as_ref().unwrap().new_txn(self.clone(), true);
             for record in batch.iter() {
@@ -581,41 +575,45 @@ impl LsmStorageInner {
     // Return the commit timestamp after writing a batch of data
     pub fn write_batch_inner<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<u64> {
         let mut max_ts = 0;
+        let mvcc = self
+            .mvcc
+            .as_ref()
+            .expect("Expected a MVCC to be initialized,in write batch inner");
         for record in batch.iter() {
-            let _write_guard = self.mvcc.as_ref().unwrap().write_lock.lock();
-            let ts = self.mvcc.as_ref().unwrap().latest_commit_ts() + 1;
+            let _write_guard = mvcc.write_lock.lock();
+            let ts = mvcc.latest_commit_ts() + 1;
             max_ts = max_ts.max(ts);
             match record {
                 WriteBatchRecord::Put(key, value) => {
-                    let _key = key.as_ref();
-                    let _value = value.as_ref();
-                    assert!(!_value.is_empty(), "Value cannot be empty");
-                    assert!(!_key.is_empty(), "Key cannot be empty");
+                    let key = key.as_ref();
+                    let value = value.as_ref();
+                    assert!(!value.is_empty(), "Value cannot be empty");
+                    assert!(!key.is_empty(), "Key cannot be empty");
                     println!("Put-Ts: {:?}", ts);
-                    let size;
-                    {
-                        let data = self.state.read();
-                        data.memtable.put(KeySlice::from_slice(_key, ts), _value)?;
-                        size = data.memtable.approximate_size()
-                    }
+                    let size = {
+                        let snapshot = self.state.read();
+                        snapshot
+                            .memtable
+                            .put(KeySlice::from_slice(key, ts), value)?;
+                        snapshot.memtable.approximate_size()
+                    };
 
                     self.try_freeze(size)?;
                 }
                 WriteBatchRecord::Del(key) => {
-                    let _key = key.as_ref();
-                    assert!(!_key.is_empty(), "Value cannot be empty");
+                    let key = key.as_ref();
+                    assert!(!key.is_empty(), "Value cannot be empty");
 
-                    let size;
-                    {
-                        let data = self.state.read();
-                        data.memtable.put(KeySlice::from_slice(_key, ts), &[])?;
-                        size = data.memtable.approximate_size()
-                    }
+                    let size = {
+                        let snapshot = self.state.read();
+                        snapshot.memtable.put(KeySlice::from_slice(key, ts), &[])?;
+                        snapshot.memtable.approximate_size()
+                    };
 
                     self.try_freeze(size)?;
                 }
             };
-            self.mvcc.as_ref().unwrap().update_commit_ts(ts);
+            mvcc.update_commit_ts(ts);
         }
         Ok(max_ts)
     }
@@ -635,11 +633,11 @@ impl LsmStorageInner {
         if self.options.target_sst_size <= size {
             // Use the state lock for singular access while freezing
             let state_lock = self.state_lock.lock();
-            let guard = self.state.read();
+            let snapshot = self.state.read();
 
             if self.options.target_sst_size <= size {
                 // Drop the read lock to memtable before freezing
-                drop(guard);
+                drop(snapshot);
                 self.force_freeze_memtable(&state_lock)?;
             }
         }
